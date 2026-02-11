@@ -364,6 +364,7 @@ class DataCharacterisation:
                 var_observations[var.tag_id].append(var.value)
 
         classifications = {}
+
         for tag_id, values in var_observations.items():
             distinct_values = set()
             for val in values:
