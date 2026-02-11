@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-S7comm Industrial Security Monitor - Production Grade (Custom Parser Edition)
-架构：
-1. Data Extraction: Scapy Sniff (TCP Layer) + Manual Byte Parsing (No contrib dependency)
-2. Data Characterisation: 论文分类逻辑 (常量/属性/连续)
-3. Modelling & Detection: 多模型融合 + scipy统计
+S7comm Industrial Security Monitor - Wireshark Style Edition
+Features:
+1. Frame Number Tracking (Matches Wireshark left column)
+2. Robust S7 Parsing (Supports DB/I/Q/M areas)
+3. Three-Phase Detection (Constant/Attribute/Continuous)
 """
 
 import logging
@@ -19,67 +19,55 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Tuple, Optional, Set, Any
 
-# 统计分析库
+# Statistics
 from scipy.stats import f
 from statsmodels.tsa.ar_model import AutoReg
 
-# Scapy 仅用于抓取 TCP 包，不依赖 s7 contrib
+# Scapy
 from scapy.all import sniff, PcapReader, TCP, IP, Raw
 
-# Snap7 用于工业数据转换 (可选，如果解析失败则回退到手动 struct)
-try:
-    from snap7.util import get_real, get_int, get_dint, get_word, get_dword
-
-    SNAP7_AVAILABLE = True
-except ImportError:
-    print("WARNING: Snap7 not found. Falling back to struct.")
-    SNAP7_AVAILABLE = False
-
-# -------------------------------------------------------------------------
-# Logging Configuration
-# -------------------------------------------------------------------------
+# Logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] [S7-Monitor] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    format='%(asctime)s %(message)s',  # Simplified format to highlight Frame info
+    datefmt='%H:%M:%S'
 )
 logger = logging.getLogger("S7-Monitor")
 warnings.filterwarnings("ignore")
 
 
 # -------------------------------------------------------------------------
-# Data Structures & Enums
+# Data Structures
 # -------------------------------------------------------------------------
 
 class VariableType(Enum):
-    """变量分类（论文Section 3.4）"""
-    CONSTANT = "constant"  # 配置变量
-    ATTRIBUTE = "attribute"  # 状态变量
-    CONTINUOUS = "continuous"  # 传感器变量
+    CONSTANT = "constant"
+    ATTRIBUTE = "attribute"
+    CONTINUOUS = "continuous"
 
 
 @dataclass
 class S7Variable:
-    """S7变量对象"""
+    """S7变量对象 (Added frame_num)"""
     timestamp: datetime
+    frame_num: int  # <--- 新增：Wireshark 编号
     plc_id: str
-    tag_id: str  # 物理标签 (e.g., "DB1.DBD10")
-    area: int  # 内存区域
-    db_number: int  # DB块号
-    address: int  # 字节地址
-    value: Any  # 解析后的值
-    data_type: str  # REAL/INT/DINT/WORD
-    operation: str  # read/write
+    tag_id: str
+    area: int
+    db_number: int
+    address: int
+    value: Any
+    data_type: str
+    operation: str
 
 
 @dataclass
 class VariableModel:
-    """变量检测模型"""
     tag_id: str
     var_type: VariableType
-    expected_values: Set[Any] = field(default_factory=set)  # 常量
-    enumeration_set: Set[Any] = field(default_factory=set)  # 属性
-    ar_model: Optional[Any] = None  # 连续
+    expected_values: Set[Any] = field(default_factory=set)
+    enumeration_set: Set[Any] = field(default_factory=set)
+    ar_model: Optional[Any] = None
     control_limits: Tuple[float, float] = (0, 0)
     train_variance: float = 0
     history: deque = field(default_factory=lambda: deque(maxlen=5))
@@ -88,8 +76,9 @@ class VariableModel:
 
 @dataclass
 class DetectionAlert:
-    """检测告警"""
+    """检测告警 (Added frame_num)"""
     timestamp: datetime
+    frame_num: int  # <--- 新增
     tag_id: str
     alert_type: str
     severity: str
@@ -99,34 +88,31 @@ class DetectionAlert:
 
 
 # -------------------------------------------------------------------------
-# Phase 1: Data Extraction Engine (Manual Byte Parsing)
+# Phase 1: Data Extraction (With Frame Counter)
 # -------------------------------------------------------------------------
 
 class S7DataExtractor:
-    """
-    S7 数据提取器 (修复版 V2 - 支持 I/Q/M/DB 全区域解析)
-    """
-
     def __init__(self):
         self.shadow_memory: Dict[int, List[Dict]] = {}
         self.variables_extracted: List[S7Variable] = []
 
-    def parse_packet(self, pkt) -> List[S7Variable]:
+    def parse_packet(self, pkt, frame_num: int) -> List[S7Variable]:
+        """
+        解析函数现在接收 frame_num 参数
+        """
         if not pkt.haslayer(TCP) or not pkt.haslayer(Raw):
             return []
 
         payload = bytes(pkt[Raw].load)
 
-        # 1. 寻找 S7 Header (0x32)
+        # 智能寻找 S7 Header (0x32)
         s7_offset = -1
-        # 快速检查
         if len(payload) > 5 and payload[0] == 0x03:
             cotp_len = payload[4]
             calc_offset = 5 + cotp_len
             if calc_offset < len(payload) and payload[calc_offset] == 0x32:
                 s7_offset = calc_offset
 
-        # 暴力搜索
         if s7_offset == -1:
             for i in range(len(payload) - 10):
                 if payload[i] == 0x32 and payload[i + 1] in [1, 2, 3]:
@@ -146,27 +132,27 @@ class S7DataExtractor:
             data_start = param_start + param_len
 
             plc_id = pkt[IP].src if pkt.haslayer(IP) else "unknown"
+            ts = datetime.fromtimestamp(float(pkt.time))
 
-            # === Job Request (Write) ===
+            # Job Request (Write)
             if rosctr == 1:
                 func = payload[param_start]
-                if func == 0x05:  # Write Var
-                    vars_ = self._handle_write_request(payload, param_start, data_start, plc_id)
+                if func == 0x05:
+                    vars_ = self._handle_write_request(payload, param_start, data_start, plc_id, ts, frame_num)
                     variables.extend(vars_)
-                elif func == 0x04:  # Read Var (记账)
+                elif func == 0x04:
                     self._handle_read_request(payload, param_start, tpdu_ref)
 
-            # === Ack_Data (Read) ===
+            # Ack_Data (Read)
             elif rosctr == 3:
                 error_class = payload[s7_offset + 10]
                 if error_class == 0:
-                    vars_ = self._handle_read_response(payload, data_start, tpdu_ref, plc_id)
+                    vars_ = self._handle_read_response(payload, data_start, tpdu_ref, plc_id, ts, frame_num)
                     variables.extend(vars_)
 
         except Exception as e:
-            pass  # 忽略解析错误的包
+            pass
 
-        # 过滤掉 value 为 None 的无效变量
         valid_vars = [v for v in variables if v.value is not None]
         self.variables_extracted.extend(valid_vars)
         return valid_vars
@@ -182,24 +168,18 @@ class S7DataExtractor:
                 db = struct.unpack('>H', payload[curr + 6:curr + 8])[0]
                 area = payload[curr + 8]
                 addr_raw = (payload[curr + 9] << 16) | (payload[curr + 10] << 8) | payload[curr + 11]
-
-                # 记录 transport size 以便后续正确解析长度
-                trans_type = payload[curr + 3]
-
-                items.append({'area': area, 'db': db, 'start': addr_raw >> 3, 'len': len_, 'type': trans_type})
+                items.append({'area': area, 'db': db, 'start': addr_raw >> 3, 'len': len_})
                 curr += 12
-
             if items:
                 self.shadow_memory[tpdu_ref] = items
         except:
             pass
 
-    def _handle_write_request(self, payload, param_start, data_start, plc_id):
+    def _handle_write_request(self, payload, param_start, data_start, plc_id, ts, frame_num):
         variables = []
         try:
             item_count = payload[param_start + 1]
-
-            # 1. Parameter (Address)
+            # 1. Parameter
             items_meta = []
             curr_p = param_start + 2
             for _ in range(item_count):
@@ -210,40 +190,37 @@ class S7DataExtractor:
                 items_meta.append({'area': area, 'db': db, 'addr': addr_raw >> 3, 'len': len_})
                 curr_p += 12
 
-            # 2. Data (Values)
+            # 2. Data
             curr_d = data_start
             for meta in items_meta:
                 if curr_d + 4 > len(payload): break
 
-                ret_code = payload[curr_d]
                 trans_size = payload[curr_d + 1]
                 raw_len = struct.unpack('>H', payload[curr_d + 2:curr_d + 4])[0]
 
-                # 计算长度 (Bits vs Bytes)
-                if trans_size in [0x03, 0x04, 0x05]:  # Bit/Word/Int -> bits
+                if trans_size in [0x03, 0x04, 0x05]:
                     byte_len = (raw_len + 7) // 8
                 else:
-                    byte_len = raw_len  # Bytes
+                    byte_len = raw_len
 
                 val_start = curr_d + 4
                 raw_bytes = payload[val_start: val_start + byte_len]
 
-                # 调用修复后的转换函数
                 tag_id, value, dtype = self._convert_value(meta['area'], meta['db'], meta['addr'], raw_bytes)
 
                 if tag_id and value is not None:
                     variables.append(S7Variable(
-                        datetime.now(), plc_id, tag_id, meta['area'], meta['db'], meta['addr'], value, dtype, 'write'
+                        ts, frame_num, plc_id, tag_id, meta['area'], meta['db'], meta['addr'], value, dtype, 'write'
                     ))
 
                 curr_d += 4 + byte_len
-                if byte_len % 2 == 1: curr_d += 1  # Padding
+                if byte_len % 2 == 1: curr_d += 1
 
         except:
             pass
         return variables
 
-    def _handle_read_response(self, payload, data_start, tpdu_ref, plc_id):
+    def _handle_read_response(self, payload, data_start, tpdu_ref, plc_id, ts, frame_num):
         if tpdu_ref not in self.shadow_memory: return []
         req_items = self.shadow_memory.pop(tpdu_ref)
         variables = []
@@ -254,9 +231,7 @@ class S7DataExtractor:
                 if curr_d + 4 > len(payload): break
 
                 ret_code = payload[curr_d]
-                trans_size = payload[curr_d + 1]
                 raw_len = struct.unpack('>H', payload[curr_d + 2:curr_d + 4])[0]
-
                 byte_len = (raw_len + 7) // 8
 
                 if ret_code == 0xFF:
@@ -264,11 +239,9 @@ class S7DataExtractor:
                     raw_bytes = payload[val_start: val_start + byte_len]
 
                     tag_id, value, dtype = self._convert_value(meta['area'], meta['db'], meta['start'], raw_bytes)
-
                     if tag_id and value is not None:
                         variables.append(S7Variable(
-                            datetime.now(), plc_id, tag_id, meta['area'], meta['db'], meta['start'], value, dtype,
-                            'read'
+                            ts, frame_num, plc_id, tag_id, meta['area'], meta['db'], meta['start'], value, dtype, 'read'
                         ))
 
                 curr_d += 4 + byte_len
@@ -279,36 +252,25 @@ class S7DataExtractor:
         return variables
 
     def _convert_value(self, area, db, addr, raw_bytes):
-        """
-        核心修复：支持 I/Q/M/DB 区域，并根据字节长度自动适配类型
-        """
         tag_id = None
-
-        # 1. 标签 ID 生成 (支持所有常用区域)
         if area == 0x84:
-            tag_id = f"DB{db}.DBD{addr}"  # DB
+            tag_id = f"DB{db}.DBD{addr}"
         elif area == 0x81:
-            tag_id = f"I{addr}"  # Input
+            tag_id = f"I{addr}"
         elif area == 0x82:
-            tag_id = f"Q{addr}"  # Output
+            tag_id = f"Q{addr}"
         elif area == 0x83:
-            tag_id = f"M{addr}"  # Merker (Flags)
+            tag_id = f"M{addr}"
         else:
-            # 允许未知区域，记录为 RAW
             tag_id = f"Area{area}_{addr}"
 
         value = None
         dtype = "RAW"
-
         try:
             length = len(raw_bytes)
-
-            # --- 4 字节: 可能是 Float 或 DWord ---
             if length == 4:
-                # 只有 DB 块才优先尝试 Float (传感器数据通常在 DB)
                 if area == 0x84:
                     f_val = struct.unpack('>f', raw_bytes)[0]
-                    # 检查 Float 合理性 (-10亿 ~ 10亿)
                     if np.isfinite(f_val) and abs(f_val) < 1e9 and abs(f_val) > 1e-9:
                         value = round(f_val, 4)
                         dtype = "REAL"
@@ -319,169 +281,138 @@ class S7DataExtractor:
                         value = struct.unpack('>I', raw_bytes)[0]
                         dtype = "DWORD"
                 else:
-                    # I/Q/M 区如果是 4 字节，通常是 DINT/DWORD
                     value = struct.unpack('>I', raw_bytes)[0]
                     dtype = "DWORD"
-
-            # --- 2 字节: Word / Int ---
             elif length == 2:
                 value = struct.unpack('>H', raw_bytes)[0]
                 dtype = "WORD"
-
-            # --- 1 字节: Byte / Bool Group ---
             elif length == 1:
-                value = raw_bytes[0]  # 直接转 int
+                value = raw_bytes[0]
                 dtype = "BYTE"
-
-            # --- 其他长度 ---
-            else:
-                # 尝试转为大整数或 hex 字符串
-                if length > 0:
-                    value = int.from_bytes(raw_bytes, byteorder='big')
-                    dtype = f"BYTES_{length}"
-
-        except Exception as e:
+        except:
             return None, None, None
-
         return tag_id, value, dtype
 
+
 # -------------------------------------------------------------------------
-# Phase 2: Data Characterisation
+# Phase 2 & 3: Characterisation & Detection
 # -------------------------------------------------------------------------
 
 class DataCharacterisation:
-    """变量特征化分类器"""
-
     def __init__(self, k: int = 3):
         self.k = k
-        self.max_distinct_for_attribute = 2 ** k
+        self.max_distinct = 2 ** k
         self.characteristics: Dict[str, VariableType] = {}
 
     def characterise_variables(self, variables: List[S7Variable]) -> Dict[str, VariableType]:
-        var_observations = defaultdict(list)
+        var_obs = defaultdict(list)
         for var in variables:
-            if var.value is not None and (isinstance(var.value, (int, float)) and np.isfinite(var.value)):
-                var_observations[var.tag_id].append(var.value)
+            if var.value is not None: var_obs[var.tag_id].append(var.value)
 
         classifications = {}
-
-        for tag_id, values in var_observations.items():
-            distinct_values = set()
-            for val in values:
-                if isinstance(val, float):
-                    distinct_values.add(round(val, 2))
+        for tag_id, values in var_obs.items():
+            distinct = set()
+            for v in values:
+                if isinstance(v, float):
+                    distinct.add(round(v, 2))
                 else:
-                    distinct_values.add(val)
+                    distinct.add(v)
 
-            num_distinct = len(distinct_values)
-            if num_distinct == 1:
-                var_type = VariableType.CONSTANT
-            elif num_distinct <= self.max_distinct_for_attribute:
-                var_type = VariableType.ATTRIBUTE
+            if len(distinct) == 1:
+                vtype = VariableType.CONSTANT
+            elif len(distinct) <= self.max_distinct:
+                vtype = VariableType.ATTRIBUTE
             else:
-                var_type = VariableType.CONTINUOUS
+                vtype = VariableType.CONTINUOUS
 
-            self.characteristics[tag_id] = var_type
-            classifications[tag_id] = var_type
-
+            self.characteristics[tag_id] = vtype
+            classifications[tag_id] = vtype
         return classifications
 
-    def print_statistics(self):
-        type_counts = Counter(self.characteristics.values())
-        logger.info("Classification Stats: " + str(dict(type_counts)))
+    def print_stats(self):
+        logger.info(f"[STATS] Variable Types: {dict(Counter(self.characteristics.values()))}")
 
-
-# -------------------------------------------------------------------------
-# Phase 3: Modelling & Detection Engine
-# -------------------------------------------------------------------------
 
 class MultiModelDetector:
-    """多模型检测引擎"""
-
-    def __init__(self, ar_lag: int = 5, f_test_window: int = 10, significance_level: float = 0.0005):
+    def __init__(self, ar_lag=5, f_win=10, alpha=0.0005):
         self.ar_lag = ar_lag
-        self.f_test_window = f_test_window
-        self.alpha = significance_level
-        self.models: Dict[str, VariableModel] = {}
-        self.alerts: List[DetectionAlert] = []
+        self.f_win = f_win
+        self.alpha = alpha
+        self.models = {}
+        self.alerts = []
 
-    def train_models(self, variables: List[S7Variable], classifications: Dict[str, VariableType]):
+    def train_models(self, variables, classifications):
         var_data = defaultdict(list)
-        for var in variables:
-            if var.value is not None: var_data[var.tag_id].append(var.value)
+        for var in variables: var_data[var.tag_id].append(var.value)
 
-        for tag_id, var_type in classifications.items():
-            values = var_data[tag_id]
-            model = VariableModel(tag_id=tag_id, var_type=var_type)
+        for tag, vtype in classifications.items():
+            vals = var_data[tag]
+            model = VariableModel(tag, vtype)
 
-            if var_type == VariableType.CONSTANT:
-                model.expected_values = set(values)
-            elif var_type == VariableType.ATTRIBUTE:
-                model.enumeration_set = set(values)
-            elif var_type == VariableType.CONTINUOUS:
+            if vtype == VariableType.CONSTANT:
+                model.expected_values = set(vals)
+            elif vtype == VariableType.ATTRIBUTE:
+                model.enumeration_set = set(vals)
+            elif vtype == VariableType.CONTINUOUS:
                 try:
-                    series = np.array(values, dtype=float)
-                    if len(series) > self.ar_lag * 3:
-                        ar = AutoReg(series, lags=self.ar_lag).fit()
+                    s = np.array(vals, dtype=float)
+                    if len(s) > self.ar_lag * 3:
+                        ar = AutoReg(s, lags=self.ar_lag).fit()
                         model.ar_model = ar
                         model.train_variance = np.var(ar.resid)
-                        mean, std = np.mean(series), np.std(series)
+                        mean, std = np.mean(s), np.std(s)
                         model.control_limits = (mean - 3 * std, mean + 3 * std)
                 except:
                     pass
-
-            self.models[tag_id] = model
+            self.models[tag] = model
 
     def detect(self, var: S7Variable) -> Optional[DetectionAlert]:
         if var.tag_id not in self.models: return None
         model = self.models[var.tag_id]
         val = var.value
 
+        # Constant
         if model.var_type == VariableType.CONSTANT:
             if val not in model.expected_values:
-                return self._create_alert(var, "CONSTANT_CHANGE", model.expected_values, val, "CRITICAL")
+                return self._alert(var, "CONST_CHG", model.expected_values, val, "CRITICAL")
 
+        # Attribute
         elif model.var_type == VariableType.ATTRIBUTE:
             if val not in model.enumeration_set:
-                return self._create_alert(var, "ATTRIBUTE_UNKNOWN", model.enumeration_set, val, "WARNING")
+                return self._alert(var, "ATTR_UNKNOWN", model.enumeration_set, val, "WARNING")
 
+        # Continuous
         elif model.var_type == VariableType.CONTINUOUS:
-            # 1. Control Limits
             l_min, l_max = model.control_limits
             if val < l_min or val > l_max:
-                return self._create_alert(var, "LIMIT_VIOLATION", f"[{l_min:.2f},{l_max:.2f}]", val, "WARNING")
+                return self._alert(var, "LIMIT_FAIL", f"[{l_min:.2f},{l_max:.2f}]", val, "WARNING")
 
-            # 2. AR Logic
             if model.ar_model and len(model.history) == self.ar_lag:
                 params = model.ar_model.params
                 pred = params[0]
                 for i in range(self.ar_lag): pred += params[i + 1] * model.history[-(i + 1)]
 
-                resid = val - pred
-                model.residual_window.append(resid)
+                model.residual_window.append(val - pred)
 
-                if len(model.residual_window) == self.f_test_window:
+                if len(model.residual_window) == self.f_win:
                     curr_var = np.var(model.residual_window)
                     f_stat = curr_var / (model.train_variance if model.train_variance > 0 else 1e-6)
-                    crit = f.ppf(1 - self.alpha, self.f_test_window - 1, 5000)
+                    crit = f.ppf(1 - self.alpha, self.f_win - 1, 5000)
 
                     if f_stat > crit:
-                        return self._create_alert(var, "PROCESS_ANOMALY", f"Pred:{pred:.2f}", val, "CRITICAL")
+                        return self._alert(var, "AR_ANOMALY", f"Pred:{pred:.2f}", val, "CRITICAL")
 
             model.history.append(val)
         return None
 
-    def _create_alert(self, var, atype, exp, obs, sev):
-        alert = DetectionAlert(var.timestamp, var.tag_id, atype, sev, exp, obs, "Anomaly detected")
+    def _alert(self, var, atype, exp, obs, sev):
+        alert = DetectionAlert(var.timestamp, var.frame_num, var.tag_id, atype, sev, exp, obs, "Anomaly")
         self.alerts.append(alert)
         return alert
 
-    def get_alert_summary(self):
-        return {'total': len(self.alerts)}
-
 
 # -------------------------------------------------------------------------
-# Main System
+# Main Monitor
 # -------------------------------------------------------------------------
 
 class IndustrialS7Monitor:
@@ -491,62 +422,62 @@ class IndustrialS7Monitor:
         self.characteriser = DataCharacterisation()
         self.detector = MultiModelDetector()
         self.trained = False
+        self.live_packet_count = 0  # 实时监控计数器
 
     def train_from_pcap(self, path):
         if not os.path.exists(path): return
         logger.info(f"Training from {path}...")
 
         with PcapReader(path) as reader:
-            for pkt in reader:
-                self.extractor.parse_packet(pkt)
+            # 使用 enumerate 生成包编号，从1开始
+            for i, pkt in enumerate(reader, start=1):
+                self.extractor.parse_packet(pkt, frame_num=i)
 
         classifications = self.characteriser.characterise_variables(self.extractor.variables_extracted)
-        self.characteriser.print_statistics()
+        self.characteriser.print_stats()
         self.detector.train_models(self.extractor.variables_extracted, classifications)
         self.trained = True
         logger.info("Training Complete.")
 
     def start_live_monitor(self):
-        if not self.trained:
-            logger.error("Not trained!")
-            return
-
+        if not self.trained: return
         logger.info(f"Monitoring {self.interface} for TCP port 102...")
 
+        self.live_packet_count = 0  # 重置计数
+
         def handler(pkt):
-            vars_ = self.extractor.parse_packet(pkt)
+            self.live_packet_count += 1
+            # 传入计数器作为 frame_num
+            vars_ = self.extractor.parse_packet(pkt, frame_num=self.live_packet_count)
             for v in vars_:
                 alert = self.detector.detect(v)
                 if alert: self._print_alert(alert)
 
         sniff(iface=self.interface, filter="tcp port 102", prn=handler, store=0)
 
+    def detect_offline(self, path):
+        if not os.path.exists(path): return
+        logger.info(f"Testing on {path}...")
+        with PcapReader(path) as reader:
+            for i, pkt in enumerate(reader, start=1):
+                vars_ = self.extractor.parse_packet(pkt, frame_num=i)
+                for v in vars_:
+                    alert = self.detector.detect(v)
+                    if alert: self._print_alert(alert)
+
     def _print_alert(self, alert):
+        # 格式化输出，带包编号
         logger.warning(
-            f"[{alert.severity}] {alert.alert_type} @ {alert.tag_id}: Obs={alert.observed}, Exp={alert.expected}")
+            f"[{alert.severity}] [Frame #{alert.frame_num}] {alert.alert_type} @ {alert.tag_id}: "
+            f"Obs={alert.observed}, Exp={alert.expected}"
+        )
 
 
-# -------------------------------------------------------------------------
-# Entry Point
-# -------------------------------------------------------------------------
 if __name__ == "__main__":
-    monitor = IndustrialS7Monitor(interface="lo")  # Change interface as needed
+    monitor = IndustrialS7Monitor(interface="lo")
 
-    # Generate dummy pcap if needed or verify files
-    if not os.path.exists("train.pcap"):
-        logger.info("Please provide train.pcap for baseline training.")
-    else:
+    if os.path.exists("train.pcap"):
         monitor.train_from_pcap("train.pcap")
 
-        # Uncomment to run live
-        # monitor.start_live_monitor()
-
-        # Or parse test pcap offline
         if os.path.exists("test.pcap"):
-            logger.info("Testing on test.pcap...")
-            with PcapReader("test.pcap") as reader:
-                for pkt in reader:
-                    vars_ = monitor.extractor.parse_packet(pkt)
-                    for v in vars_:
-                        alert = monitor.detector.detect(v)
-                        if alert: monitor._print_alert(alert)
+            monitor.detect_offline("test.pcap")
