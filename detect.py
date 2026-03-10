@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
-"""
-S7comm Semantic Security Monitor - Refactored for Paper Compliance (Burg's Method)
-Refactored to align with "Through the Eye of the PLC"
-Changes:
-1. Implemented Burg's Method for AR coefficient estimation.
-2. Implemented AIC (Akaike Information Criterion) for AR order selection.
-3. Added Time-Series Resampling (1Hz Zero-Order Hold) for correct AR modeling.
-4. Enhanced S7 Heuristic Parsing for robust extraction.
-5. Added Rule Export Functionality.
-6. Added Model Persistence (Save/Load).
-"""
+
 
 import logging
 import warnings
@@ -24,7 +14,7 @@ from enum import Enum
 from typing import Dict, List, Tuple, Optional, Set, Any
 
 # Statistics
-from scipy.stats import f
+from scipy.stats import f as f_dist
 
 # Scapy
 from scapy.all import sniff, PcapReader, TCP, IP, Raw
@@ -48,34 +38,48 @@ def ar_burg(x: np.ndarray, order: int) -> Tuple[np.ndarray, float]:
     Estimate AR coefficients using Burg's method.
     """
     N = len(x)
-    f = x.copy()
-    b = x.copy()
+    if N < order + 2:
+        raise ValueError(f"样本量 {N} 不足以估计 AR({order})")
+    fwd = x.astype(float).copy()
+    bwd = x.astype(float).copy()
     a = np.zeros(0)
-    sigma2 = np.dot(x, x) / N
+    sigma2 = float(np.dot(x, x) / N)
 
     for k in range(1, order + 1):
-        numer = -2.0 * np.dot(f[k:], b[k - 1:N - 1])
-        denom = np.dot(f[k:], f[k:]) + np.dot(b[k - 1:N - 1], b[k - 1:N - 1])
+        f1 = fwd[1:]
+        b0 = bwd[:-1]
 
-        if denom == 0:
-            mu = 0
-        else:
-            mu = numer / denom
+        numer = -2.0 * np.dot(f1, b0)
+        denom = np.dot(f1, f1) + np.dot(b0, b0)
 
+        mu = 0.0 if denom == 0 else float(numer / denom)
+        mu = float(np.clip(mu, -1 + 1e-9, 1 - 1e-9))
+
+        # levinson-durbin
         if len(a) > 0:
-            a_prev = a.copy()
-            a = a_prev + mu * a_prev[::-1]
-
+            a = a + mu * a[::-1]
         a = np.append(a, mu)
 
-        f_new = f[1:] + mu * b[:-1]
-        b_new = b[:-1] + mu * f[1:]
-        f = f_new
-        b = b_new
-        sigma2 = (1.0 - mu ** 2) * sigma2
+        fwd = f1 + mu * b0
+        bwd = b0 + mu * f1
+        sigma2 *= (1.0 - mu ** 2)
 
-    return a, sigma2
+    return a, max(float(sigma2), 1e-12)
 
+# =========================================================================
+# 阶数选择：AIC
+# 原文: "To estimate the order of the model, we use the common
+#        Akaike information criterion [34]"
+# 参考: Sugiura (1978), Communications in Statistics
+#
+# 标准 AIC = N * ln(σ²) + 2 * (自由参数数)
+# AR(p) 模型在去均值后，自由参数为 p 个系数。
+# =========================================================================
+
+def aic_ar(N: int, sigma2: float, p: int) -> float:
+    if sigma2 <= 0:
+        return float('inf')
+    return N * np.log(sigma2) + 2 * p
 
 # -------------------------------------------------------------------------
 # Data Structures
@@ -118,10 +122,27 @@ class VariableModel:
 
     # Detection State
     train_residual_variance: float = 0.0
-    history_buffer: deque = field(default_factory=lambda: deque(maxlen=20))
-    prediction_errors: deque = field(default_factory=lambda: deque(maxlen=15))
+    history_buffer: deque = field(default_factory=lambda: deque(maxlen=50))
+    prediction_errors: deque = field(default_factory=lambda: deque(maxlen=30))
     last_seen_time: float = 0.0
     last_seen_value: float = 0.0
+
+    # ------------------------------------------------------------------
+    # Warmup 机制
+    # 论文使用 rolling forecasting（训练集与测试集紧接），
+    # 在真实部署场景中训练结束到上线之间存在时间差，
+    # 必须先用真实在线数据重新填充 history_buffer，
+    # 而不是使用可能已过时的训练集末尾值。
+    #
+    # warmup_n    : 开始真正检测前需要积累的在线观测数量。
+    #               未被论文规定，由调用方根据轮询频率设定。
+    #               例：轮询周期~2s，warmup_n=30 ≈ 1分钟的缓冲。
+    # warmup_done : True 后不再修改，进入正式检测模式。
+    # warmup_count: 已累积的在线观测计数。
+    # ------------------------------------------------------------------
+    warmup_n: int = 30
+    warmup_done: bool = False
+    warmup_count: int = 0
 
 
 @dataclass
@@ -137,7 +158,7 @@ class DetectionAlert:
 
 
 # -------------------------------------------------------------------------
-# Phase 1: Data Extraction (Robust)
+# Phase 1: Data Extraction (protocol parse, shadow memory)
 # -------------------------------------------------------------------------
 
 class S7DataExtractor:
@@ -240,11 +261,8 @@ class S7DataExtractor:
                 val_start = curr_d + 4
                 raw_bytes = payload[val_start: val_start + byte_len]
 
-                tag_id, value, dtype = self._convert_value(meta['area'], meta['db'], meta['addr'], raw_bytes)
-                if tag_id and value is not None:
-                    variables.append(
-                        S7Variable(ts, frame_num, plc_id, tag_id, meta['area'], meta['db'], meta['addr'], value, dtype,
-                                   'write'))
+                for tag_id, addr, value, dtype in self._extract_variables(meta['area'], meta['db'], meta['addr'], raw_bytes):
+                    variables.append(S7Variable(ts, frame_num, plc_id, tag_id, meta['area'], meta['db'], addr, value, dtype, 'write'))
 
                 curr_d += 4 + byte_len
                 if byte_len % 2 == 1: curr_d += 1
@@ -268,11 +286,8 @@ class S7DataExtractor:
                 if ret_code == 0xFF:
                     val_start = curr_d + 4
                     raw_bytes = payload[val_start: val_start + byte_len]
-                    tag_id, value, dtype = self._convert_value(meta['area'], meta['db'], meta['start'], raw_bytes)
-                    if tag_id and value is not None:
-                        variables.append(
-                            S7Variable(ts, frame_num, plc_id, tag_id, meta['area'], meta['db'], meta['start'], value,
-                                       dtype, 'read'))
+                    for tag_id, addr, value, dtype in self._extract_variables(meta['area'], meta['db'], meta['start'], raw_bytes):
+                        variables.append(S7Variable(ts, frame_num, plc_id, tag_id, meta['area'], meta['db'], addr, value, dtype, 'read'))
 
                 curr_d += 4 + byte_len
                 if byte_len % 2 == 1: curr_d += 1
@@ -280,39 +295,51 @@ class S7DataExtractor:
             pass
         return variables
 
-    def _convert_value(self, area, db, addr, raw_bytes):
-        if area == 0x84:
-            tag_id = f"DB{db}.DBD{addr}"
-        elif area == 0x81:
-            tag_id = f"I{addr}"
-        elif area == 0x82:
-            tag_id = f"Q{addr}"
-        elif area == 0x83:
-            tag_id = f"M{addr}"
-        else:
-            tag_id = f"Area{area}_{addr}"
+    def _extract_variables(self, area, db, base_addr, raw_bytes):
+        extracted = []
+        length = len(raw_bytes)
 
-        value = None
-        dtype = "RAW"
-        try:
-            length = len(raw_bytes)
-            if length == 4:
-                f_val = struct.unpack('>f', raw_bytes)[0]
-                if np.isfinite(f_val) and 1e-9 < abs(f_val) < 1e9:
-                    value = round(f_val, 4)
-                    dtype = "REAL"
+        if area == 0x84:
+            prefix = f"DB{db}.DB"
+        elif area == 0x81:
+            prefix = "I"
+        elif area == 0x82:
+            prefix = "Q"
+        elif area == 0x83:
+            prefix = "M"
+        else:
+            prefix = f"Area{area}_"
+
+        if length == 1:
+            tag_id = f"{prefix}B{base_addr}" if area == 0x84 else f"{prefix}{base_addr}"
+            extracted.append((tag_id, base_addr, raw_bytes[0], "BYTE"))
+        elif length == 2:
+            tag_id = f"{prefix}W{base_addr}"
+            val = struct.unpack('>h', raw_bytes)[0]
+            extracted.append((tag_id, base_addr, val, "INT"))
+        elif length == 4:
+            tag_id = f"{prefix}D{base_addr}"
+            f_val = struct.unpack('>f', raw_bytes)[0]
+            if np.isfinite(f_val) and 1e-9 < abs(f_val) < 1e9:
+                extracted.append((tag_id, base_addr, round(f_val, 4), "REAL"))
+            else:
+                val = struct.unpack('>i', raw_bytes)[0]
+                extracted.append((tag_id, base_addr, val, "DINT"))
+        elif length > 4:
+            i = 0
+            while i < length:
+                curr_addr = base_addr + i
+                if curr_addr >= 100 and (length - i) >= 2:
+                    tag_id = f"{prefix}W{curr_addr}"
+                    val = struct.unpack('>h', raw_bytes[i:i + 2])[0]
+                    extracted.append((tag_id, curr_addr, val, "INT"))
+                    i += 2
                 else:
-                    value = struct.unpack('>I', raw_bytes)[0]
-                    dtype = "DWORD"
-            elif length == 2:
-                value = struct.unpack('>H', raw_bytes)[0]
-                dtype = "WORD"
-            elif length == 1:
-                value = raw_bytes[0]
-                dtype = "BYTE"
-        except:
-            return None, None, None
-        return tag_id, value, dtype
+                    tag_id = f"{prefix}B{curr_addr}" if area == 0x84 else f"{prefix}{curr_addr}"
+                    extracted.append((tag_id, curr_addr, raw_bytes[i], "BYTE"))
+                    i += 1
+
+        return extracted
 
 
 # -------------------------------------------------------------------------
@@ -322,191 +349,345 @@ class S7DataExtractor:
 class DataCharacterisation:
     def __init__(self, k: int = 3):
         self.k = k
-        self.max_distinct = 2 ** k
-        self.characteristics: Dict[str, VariableType] = {}
+        self.max_distinct = 2 ** k   # = 8
 
     def characterise_variables(self, variables: List[S7Variable]) -> Dict[str, VariableType]:
-        var_obs = defaultdict(list)
+        var_obs: Dict[str, List] = defaultdict(list)
         for var in variables:
-            if var.value is not None: var_obs[var.tag_id].append(var.value)
+            if var.value is not None:
+                var_obs[var.tag_id].append(var.value)
 
         classifications = {}
         for tag_id, values in var_obs.items():
             distinct = set(values)
-
+            # [PAPER 3.4] 三分类规则
             if len(distinct) == 1:
                 vtype = VariableType.CONSTANT
             elif len(distinct) <= self.max_distinct:
                 vtype = VariableType.ATTRIBUTE
             else:
                 vtype = VariableType.CONTINUOUS
-
-            self.characteristics[tag_id] = vtype
             classifications[tag_id] = vtype
-        return classifications
 
+        return classifications
 
 # -------------------------------------------------------------------------
 # Phase 3: Modelling & Detection (AIC & Burg's Method)
 # -------------------------------------------------------------------------
+"""
+    [PAPER §4] 论文明确规定的所有参数：
+
+    1. AR系数估计：Burg法
+    2. AR阶数选择：AIC
+    3. 控制限：Shewhart，均值 ± 3σ
+    4. 检测方法：两个F检验 (two variance hypothesis tests)
+    5. 显著性水平：p = 0.05% = 0.0005（两个检验相同）
+
+    [PAPER §3.5] 检测规则：
+    - 常量/属性：值不在枚举集中则报警
+    - 连续变量：(i) 超出控制限 OR (ii) AR预测偏差 → 报警
+
+    [PAPER §3.5] AR偏差判断：
+    "we compare the residual variance (observed during training) with
+     the prediction error variance (observed during testing).
+     A prediction error variance that is significantly higher than the
+     residual variance implies that the real stream has deviated"
+"""
 
 class MultiModelDetector:
-    def __init__(self, sampling_rate=1.0, alpha=0.001):
-        self.sampling_rate = sampling_rate
+    # [PAPER §4] 论文原文: "we set p = 0.05% as their significance level"
+    # p = 0.05% = 0.05/100 = 0.0005
+    ALPHA: float = 0.0005
+
+    # [IMPL] 默认 warmup 观测数量
+    # 论文未规定此值（rolling forecasting 中不存在此问题）。
+    # 对于轮询周期 ~2s 的工业现场，30个观测 ≈ 1分钟；
+    # 对于更慢的轮询（~4s），建议提高到 60~90。
+    DEFAULT_WARMUP_N: int = 30
+
+    def __init__(self, alpha: float = ALPHA, warmup_n: int = DEFAULT_WARMUP_N):
         self.alpha = alpha
-        self.models = {}
-        self.alerts = []
-
-    def _resample_series(self, times, values) -> np.ndarray:
-        if not times: return np.array([])
-        t_start = np.floor(min(times))
-        t_end = np.ceil(max(times))
-
-        grid = np.arange(t_start, t_end + self.sampling_rate, self.sampling_rate)
-        resampled = np.zeros(len(grid))
-
-        curr_val = values[0]
-        v_idx = 0
-        for i, t in enumerate(grid):
-            while v_idx < len(times) - 1 and times[v_idx + 1] <= t:
-                v_idx += 1
-                curr_val = values[v_idx]
-            resampled[i] = curr_val
-
-        return resampled
+        self.warmup_n = warmup_n
+        self.models: Dict[str, VariableModel] = {}
+        self.alerts: List[DetectionAlert] = []
 
     def train_models(self, variables: List[S7Variable], classifications: Dict[str, VariableType]):
-        var_data = defaultdict(lambda: {'t': [], 'v': []})
+        """
+                [PAPER §3.5] 对三类变量分别建立预测模型。
+
+                连续变量建模步骤：
+                1. 提取值序列（直接使用观测序列，无重采样）
+                2. 计算 Shewhart 控制限：[μ-3σ, μ+3σ]
+                3. 去均值（μ即论文公式中的 φ0）
+                4. Burg法 + AIC 选最优AR阶数 p
+                5. 保存 AR系数、均值、训练残差方差
+        """
+        var_data: Dict[str, Dict] = defaultdict(lambda: {'v': [], 't': []})
         for var in variables:
             var_data[var.tag_id]['t'].append(var.timestamp)
             var_data[var.tag_id]['v'].append(var.value)
 
         for tag, vtype in classifications.items():
-            vals = var_data[tag]['v']
+            vals = [float(v) for v in var_data[tag]['v'] if v is not None]
             times = var_data[tag]['t']
-            model = VariableModel(tag, vtype)
+            model = VariableModel(tag_id=tag, var_type=vtype, warmup_n=self.warmup_n)
 
             if vtype == VariableType.CONSTANT:
-                model.expected_values = set(vals)
+                model.expected_values = set(var_data[tag]['v'])
 
             elif vtype == VariableType.ATTRIBUTE:
-                model.enumeration_set = set(vals)
+                model.enumeration_set = set(var_data[tag]['v'])
 
             elif vtype == VariableType.CONTINUOUS:
-                ts_values = self._resample_series(times, vals)
-                mean, std = np.mean(ts_values), np.std(ts_values)
-                model.control_limits = (mean - 3 * std, mean + 3 * std)
+                if not vals:
+                    self.models[tag] = model
+                    continue
 
-                if len(ts_values) > 20:
-                    ts_mean = np.mean(ts_values)
-                    ts_centered = ts_values - ts_mean
-                    model.ar_mean = ts_mean
+                arr = np.array(vals)
+
+                # [PAPER §3.5] Shewhart 控制限：μ ± 3σ
+                # [IMPL] 使用无偏估计 ddof=1，符合 SPC 标准（参考文献[38]）
+                mu = float(np.mean(arr))
+                sigma = float(np.std(arr, ddof=1))
+                model.control_limits = (mu - 3 * sigma, mu + 3 * sigma)
+
+                # [PAPER §3.5] AR模型：去均值后拟合
+                # [PAPER §4] Burg法 + AIC
+                # [IMPL] 最小样本量=20（保证AIC有意义），最大搜索阶数=min(10, N//5)
+                min_samples = 20
+                if len(arr) > min_samples:
+                    centered = arr - mu
+                    model.ar_mean = mu
+
+                    N = len(centered)
+                    max_order = min(10, N // 5)
 
                     best_aic = float('inf')
-                    best_params = None
-                    best_lag = 1
-                    best_variance = 0.0
+                    best_p, best_params, best_var = 1, None, 0.0
 
-                    max_search = min(10, len(ts_values) // 5)
-                    N = len(ts_centered)
-
-                    for p in range(1, max_search + 1):
+                    for p in range(1, max_order + 1):
                         try:
-                            coeffs, sigma2 = ar_burg(ts_centered, p)
-                            if sigma2 <= 0: continue
-                            aic = N * np.log(sigma2) + 2 * (p + 1)
-
-                            if aic < best_aic:
-                                best_aic = aic
-                                best_lag = p
+                            coeffs, sigma2 = ar_burg(centered, p)
+                            current_aic = aic_ar(N, sigma2, p)
+                            if current_aic < best_aic:
+                                best_aic = current_aic
+                                best_p = p
                                 best_params = coeffs
-                                best_variance = sigma2
-                        except:
+                                best_var = sigma2
+                        except Exception:
                             continue
 
                     if best_params is not None:
-                        model.ar_lag_p = best_lag
+                        model.ar_lag_p = best_p
                         model.ar_model_params = best_params
-                        model.train_residual_variance = best_variance
-                        logger.info(f"Model {tag}: AR({best_lag}) via Burg/AIC. Var={best_variance:.4f}")
+                        model.train_residual_variance = best_var
+                        # [IMPL] 训练结束后 history_buffer 保持空，等待在线 warmup 阶段用真实数据填充。
+                        logger.info(
+                            f"[TRAIN] {tag}: AR({best_p}) | "
+                            f"AIC={best_aic:.2f} | σ²_train={best_var:.6f} | "
+                            f"warmup_n={model.warmup_n}"
+                        )
 
-                model.last_seen_value = vals[-1] if vals else 0
-                model.last_seen_time = times[-1] if times else 0
+                model.last_seen_value = vals[-1]
+                model.last_seen_time = times[-1]
 
             self.models[tag] = model
 
+        # ------------------------------------------------------------------
+        # [PAPER §4] 两个F检验
+        # "two variance hypothesis tests (commonly known as F-test).
+        #  For both tests we set p = 0.05%"
+        #
+        # 根据论文引用的参考文献 [19] (Hoon 1995) 和 [38] (Wetherill & Brown 1991)：
+        # Test 1（上侧）: 检测在线方差是否显著大于训练方差（过程漂移/攻击）
+        # Test 2（下侧）: 检测训练方差是否显著大于在线方差（数据压缩/传感器故障）
+        # 两个检验均使用 α = 0.0005
+        # ------------------------------------------------------------------
+
+    def _two_f_tests(self, model: VariableModel) -> Optional[str]:
+        """
+        返回:
+          None       → 两个检验均未拒绝 H0，无异常
+          "upper"    → Test 1 拒绝（在线方差显著偏高，过程偏离）
+          "lower"    → Test 2 拒绝（在线方差显著偏低，异常平稳）
+        """
+        errors = np.array(list(model.prediction_errors))
+        n = len(errors)
+        if n < 5:
+            return None
+
+        # [IMPL] 在线方差估计使用无偏估计
+        online_var = float(np.var(errors, ddof=1))
+        train_var = max(model.train_residual_variance, 1e-12)
+
+        # [IMPL] 训练集自由度设为 1000（大样本近似），与论文原始实现一致
+        # 论文未明确说明训练集自由度，1000 是参考 Hoon(1995) 推荐的近似
+        df_online = n - 1
+        df_train = 1000
+
+        # [PAPER §4] Test 1（上侧）：在线方差 >> 训练方差
+        f_stat_upper = online_var / train_var
+        crit_upper = f_dist.ppf(1 - self.alpha, df_online, df_train)
+        if f_stat_upper > crit_upper:
+            return "upper"
+
+        # [PAPER §4] Test 2（下侧）：训练方差 >> 在线方差
+        f_stat_lower = train_var / online_var
+        crit_lower = f_dist.ppf(1 - self.alpha, df_train, df_online)
+        if f_stat_lower > crit_lower:
+            return "lower"
+
+        return None
+
     def detect(self, var: S7Variable) -> Optional[DetectionAlert]:
+        """
+        [PAPER §3.5] 检测逻辑：
+
+        常量：值不在 expected_values 中 → CRITICAL
+        属性：值不在 enumeration_set 中 → WARNING
+        连续：
+          (i)  超出控制限 [Lmin, Lmax] → WARNING
+          (ii) AR预测偏差（双F检验）→ CRITICAL/WARNING
+        """
         if var.tag_id not in self.models: return None
         model = self.models[var.tag_id]
         val = var.value
 
         if model.var_type == VariableType.CONSTANT:
             if val not in model.expected_values:
-                return self._alert(var, "CONST_CHG", model.expected_values, val, "CRITICAL")
+                return self._alert(var, "CONST_CHG", model.expected_values, val, "CRITICAL","")
 
         elif model.var_type == VariableType.ATTRIBUTE:
             if val not in model.enumeration_set:
-                return self._alert(var, "ATTR_UNKNOWN", model.enumeration_set, val, "WARNING")
+                return self._alert(var, "ATTR_UNKNOWN", model.enumeration_set, val, "WARNING","")
+
+
+        # 连续变量检测
 
         elif model.var_type == VariableType.CONTINUOUS:
-            l_min, l_max = model.control_limits
-            if val < l_min or val > l_max:
-                return self._alert(var, "LIMIT_FAIL", f"[{l_min:.2f},{l_max:.2f}]", val, "WARNING")
 
-            if model.ar_model_params is not None:
-                if model.last_seen_time == 0:
-                    delta_steps = 1
-                else:
-                    delta_sec = var.timestamp - model.last_seen_time
-                    delta_steps = max(1, int(round(delta_sec / self.sampling_rate)))
+            val = float(val)
+            # ----------------------------------------------------------
+            # Warmup 阶段：history_buffer 用真实在线数据填充
+            #
+            # 设计依据：
+            #   论文的 rolling forecasting 假设测试集紧接训练集，
+            #   但实际部署中两者之间存在时间间隔。
+            #   在 warmup 期间：
+            #     - 控制限检测仍然运行（控制限只依赖均值/方差，不需要历史序列）
+            #     - AR检测暂停（history_buffer 尚未充分填充在线数据）
+            #     - 每个观测值都进入 history_buffer，建立真实的在线历史基础
+            #
+            # warmup 结束条件：累积到 warmup_n 个在线观测
+            # ----------------------------------------------------------
 
-                params = model.ar_model_params
-                mu = model.ar_mean
-
-                for _ in range(delta_steps):
-                    if len(model.history_buffer) >= model.ar_lag_p:
-                        pred_centered = 0.0
-                        for i in range(model.ar_lag_p):
-                            past_val = model.history_buffer[-(i + 1)]
-                            pred_centered += params[i] * (past_val - mu)
-
-                        pred = mu + pred_centered
-                        residual = val - pred
-                        model.prediction_errors.append(residual)
-
-                        if len(model.prediction_errors) >= 10:
-                            test_var = np.var(model.prediction_errors)
-                            train_var = model.train_residual_variance if model.train_residual_variance > 0 else 1e-6
-                            f_stat = test_var / train_var
-
-                            crit = f.ppf(1 - self.alpha, len(model.prediction_errors) - 1, 1000)
-
-                            if f_stat > crit:
-                                return self._alert(var, "AR_ANOMALY", f"Pred:{pred:.2f}", val, "CRITICAL")
-
-                    model.history_buffer.append(val)
-
+            if not model.warmup_done:
+                model.history_buffer.append(val)
                 model.last_seen_time = var.timestamp
                 model.last_seen_value = val
+                model.warmup_count += 1
+
+                if model.warmup_count >= model.warmup_n:
+                    model.warmup_done = True
+                    logger.info(
+                        f"[WARMUP DONE] {var.tag_id}: "
+                        f"已积累 {model.warmup_count} 个在线观测，开始正式检测"
+                    )
+                else:
+                    # warmup 间只做控制限检测
+                    l_min, l_max = model.control_limits
+                    if val < l_min or val > l_max:
+                        return self._alert(
+                            var, "LIMIT_FAIL",
+                            f"[{l_min:.4f}, {l_max:.4f}]", val,
+                            "WARNING",
+                            f"[Warmup {model.warmup_count}/{model.warmup_n}] "
+                            f"超出Shewhart控制限"
+                        )
+                return None  # warmup 期间 AR 检测不运行
+
+            # ----------------------------------------------------------
+            # 正式检测阶段（warmup_done = True）
+            # ----------------------------------------------------------
+
+            # [PAPER §3.5] (i) 控制限检测
+            l_min, l_max = model.control_limits
+            if val < l_min or val > l_max:
+                return self._alert(
+                    var, "LIMIT_FAIL",
+                    f"[{l_min:.4f}, {l_max:.4f}]", val,
+                    "WARNING", "超出Shewhart控制限")
+
+            # [PAPER §3.5] (ii) AR预测偏差检测
+            if model.ar_model_params is not None and model.ar_lag_p > 0:
+                p = model.ar_lag_p
+                params = model.ar_model_params
+                mu = model.ar_mean
+                if len(model.history_buffer) >= p:
+                    # 一步预测：xi_hat = μ + Σ φi*(x_{t-i} - μ)
+                    hist = list(model.history_buffer)
+                    pred_centered = sum(
+                        params[i] * (hist[-(i + 1)] - mu)
+                        for i in range(p)
+                    )
+                    pred = mu + pred_centered
+                    residual = val - pred
+                    model.prediction_errors.append(residual)
+
+                    # [PAPER §4] 积累足够误差后运行双F检验
+                    # [IMPL] 至少10个误差才开始检验，避免初始阶段假阳性
+                    if len(model.prediction_errors) >= 10:
+                        test_result = self._two_f_tests(model)
+                        if test_result == "upper":
+                            return self._alert(
+                                var, "AR_ANOMALY_HIGH",
+                                f"Pred:{pred:.4f}", val,
+                                "CRITICAL",
+                                f"在线预测误差方差显著高于训练基准 "
+                                f"(σ²_online={np.var(list(model.prediction_errors), ddof=1):.4f} "
+                                f"vs σ²_train={model.train_residual_variance:.4f})"
+                            )
+
+                        elif test_result == "lower":
+                            return self._alert(
+                                var, "AR_ANOMALY_LOW",
+                                f"Pred:{pred:.4f}", val,
+                                "WARNING",
+                                "在线预测误差方差异常偏低（可能存在数据重放）"
+                            )
+
+            model.history_buffer.append(val)
+            model.last_seen_time = var.timestamp
+            model.last_seen_value = val
 
         return None
 
-    def _alert(self, var, atype, exp, obs, sev):
-        alert = DetectionAlert(var.timestamp, var.frame_num, var.tag_id, atype, sev, exp, obs, "Anomaly")
+    def _alert(self, var: S7Variable, atype: str, expected: Any,
+                    observed: Any, severity: str, details: str) -> DetectionAlert:
+        alert = DetectionAlert(
+            var.timestamp, var.frame_num, var.tag_id,
+            atype, severity, expected, observed, details
+        )
         self.alerts.append(alert)
         return alert
-
 
 # -------------------------------------------------------------------------
 # Main Monitor Execution
 # -------------------------------------------------------------------------
 
 class IndustrialS7Monitor:
-    def __init__(self, interface="lo"):
+    def __init__(self, interface: str = "lo",
+                 warmup_n: int = MultiModelDetector.DEFAULT_WARMUP_N):
         self.interface = interface
+        # [PAPER §4] k=3
         self.extractor = S7DataExtractor()
-        self.characteriser = DataCharacterisation()
-        self.detector = MultiModelDetector()
+        self.characteriser = DataCharacterisation(k=3)
+        # [PAPER §4] α=0.0005
+        # [IMPL] warmup_n: 每个连续变量在开始AR检测前需积累的在线观测数量
+        self.detector = MultiModelDetector(
+            alpha=MultiModelDetector.ALPHA,
+            warmup_n=warmup_n
+        )
         self.trained = False
         self.live_packet_count = 0
 
@@ -563,10 +744,12 @@ class IndustrialS7Monitor:
         print(f"{'LEARNED PROCESS RULES (SEMANTIC MODEL)':^80}")
         print("=" * 80)
 
+        type_counts = {t: 0 for t in VariableType}
         # Sort by Tag ID for readability
         sorted_models = sorted(self.detector.models.items())
 
         for tag, model in sorted_models:
+            type_counts[model.var_type] += 1
             print(f"[-] TAG: {tag:<20} | TYPE: {model.var_type.value.upper()}")
 
             if model.var_type == VariableType.CONSTANT:
@@ -588,6 +771,13 @@ class IndustrialS7Monitor:
                     print("    AR Model          : Not converged or insufficient data for AR")
             print("-" * 80)
         print("\n")
+        total = sum(type_counts.values())
+        for t, cnt in type_counts.items():
+            pct = 100 * cnt / total if total > 0 else 0
+            print(f"  {t.value:12}: {cnt:4} 个 ({pct:.1f}%)")
+        # [PAPER §5.2] 论文水厂数据: 常量约95.5%，属性1.4%，连续3.1%
+        print("  (论文水厂基准: 常量≈95.5%, 属性≈1.4%, 连续≈3.1%)")
+        print("=" * 90 + "\n")
 
     def start_live_monitor(self):
         if not self.trained: return
@@ -623,10 +813,14 @@ class IndustrialS7Monitor:
 
 if __name__ == "__main__":
     # Modify Interface Here
-    monitor = IndustrialS7Monitor(interface="以太网")
+    # warmup_n 设定说明：
+    #   若轮询周期 ~2s：warmup_n=30 ≈ 1分钟
+    #   若轮询周期 ~4s：warmup_n=60 ≈ 4分钟（建议，覆盖1个完整过程周期）
+    #   若有明确的过程周期信息（如水厂8小时班次），可设置更大的值
+    monitor = IndustrialS7Monitor(interface="Ethernet 3", warmup_n=30)
 
     MODEL_FILE = "s7_model.pkl"
-    PCAP_FILE = "../dataset/s7comm_train.pcap"
+    PCAP_FILE = "tank train.pcap"
 
     # 1. Check if model exists
     if os.path.exists(MODEL_FILE):
