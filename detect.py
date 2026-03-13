@@ -128,10 +128,10 @@ class VariableModel:
     last_seen_value: float = 0.0
 
     # ------------------------------------------------------------------
-    # Warmup 机制
-    # 论文使用 rolling forecasting（训练集与测试集紧接），
+    # Warmup
+    # article use rolling forecasting（训练集与测试集紧接），
     # 在真实部署场景中训练结束到上线之间存在时间差，
-    # 必须先用真实在线数据重新填充 history_buffer，
+    # 必须先用真实在线数据重新填充 history_buffer，（认为合法）
     # 而不是使用可能已过时的训练集末尾值。
     #
     # warmup_n    : 开始真正检测前需要积累的在线观测数量。
